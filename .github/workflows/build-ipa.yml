@@ -1,0 +1,128 @@
+name: Build Movix iPhone IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: movix-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Compile unsigned iPhone app
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Select installed Xcode
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_16.4.app/Contents/Developer ]; then
+            sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcodebuild -list -project Movix.xcodeproj
+
+      - name: Compile Release for an actual iPhone
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild \
+            -project Movix.xcodeproj \
+            -scheme Movix \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/Movix.xcresult \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build 2>&1 | tee build/xcodebuild.log
+
+      - name: Verify device executable and package unsigned IPA
+        env:
+          MOVIX_COMMIT: ${{ github.sha }}
+          MOVIX_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          bash scripts/package-ipa.sh \
+            build/DerivedData/Build/Products/Release-iphoneos/Movix.app \
+            dist
+
+      - name: Save IPA and verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Movix-unsigned-ipa
+          path: |
+            dist/Movix-unsigned.ipa
+            dist/Movix-unsigned.ipa.sha256
+            dist/build-info.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Publish downloadable IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MOVIX_COMMIT: ${{ github.sha }}
+          MOVIX_RUN_ID: ${{ github.run_id }}
+          MOVIX_RUN_NUMBER: ${{ github.run_number }}
+          MOVIX_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          tag="movix-build-${MOVIX_RUN_NUMBER}-${MOVIX_RUN_ATTEMPT}"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          info = json.loads(Path('dist/build-info.json').read_text())
+          notes = '\n'.join([
+              'Application Movix compilée en Release pour iPhone (arm64, iOS 16+).',
+              '',
+              'Le fichier IPA contient `Payload/Movix.app`. Il est non signé : utilisez Sideloadly pour le signer et l’installer.',
+              '',
+              f"Source : `{os.environ['MOVIX_COMMIT']}`",
+              f"Xcode : {info['xcode'].replace(chr(10), ' / ')}",
+              f"SDK iPhoneOS : {info['iphoneos_sdk']}",
+              f"Compilation : https://github.com/{os.environ['GH_REPO']}/actions/runs/{os.environ['MOVIX_RUN_ID']}",
+              '',
+              'La compilation et le paquet ont été vérifiés automatiquement. Aucun test sur iPhone physique n’est revendiqué.',
+          ]) + '\n'
+          Path('build/release-notes.md').write_text(notes, encoding='utf-8')
+          PY
+          gh release create "$tag" \
+            dist/Movix-unsigned.ipa \
+            dist/Movix-unsigned.ipa.sha256 \
+            dist/build-info.json \
+            --target "$MOVIX_COMMIT" \
+            --title "Movix iPhone — build ${MOVIX_RUN_NUMBER}" \
+            --notes-file build/release-notes.md \
+            --latest
+          printf '### IPA iPhone compilé\n\n[Télécharger Movix-unsigned.ipa](https://github.com/%s/releases/download/%s/Movix-unsigned.ipa)\n\n' "$GH_REPO" "$tag" >> "$GITHUB_STEP_SUMMARY"
+          printf 'IPA non signé, arm64, iOS 16+. Signature et installation avec Sideloadly. Aucun test sur iPhone physique.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Movix-build-logs
+          path: |
+            build/xcodebuild.log
+            build/Movix.xcresult
+          if-no-files-found: warn
+          retention-days: 14
